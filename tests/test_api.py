@@ -1,9 +1,13 @@
 import json
+import os
+import tempfile
 import unittest
+from pathlib import Path
 
 from starlette.testclient import TestClient
 
 from creel.adapters.api import create_app
+from creel.core.env import read_env
 from creel.core.guard import GuardConfig
 from creel.core.orchestrator import Orchestrator
 from creel.extract.base import ExtractOutcome
@@ -127,6 +131,82 @@ class TestStreamAndSyncAgree(unittest.TestCase):
         self.assertEqual(sync_body["data"], stream_body["data"])
         self.assertEqual(sync_body["markdown"], stream_body["markdown"])
         self.assertEqual(sync_body["status"], stream_body["status"])
+
+
+class TestSettingsEndpoint(unittest.TestCase):
+    # settings_save intentionally mutates the real os.environ (so an NVIDIA
+    # key change applies without a server restart) -- snapshot/restore
+    # around every test here so that real behavior doesn't leak into later
+    # tests in the same unittest process, the same class of bug the
+    # cli.py load_dotenv() ordering fix addressed earlier.
+    def setUp(self):
+        self._env_snapshot = dict(os.environ)
+
+    def tearDown(self):
+        os.environ.clear()
+        os.environ.update(self._env_snapshot)
+
+    def test_page_loads(self):
+        app = create_app(Orchestrator(guard_config=_LOCAL))
+        resp = TestClient(app).get("/settings")
+        self.assertEqual(resp.status_code, 200)
+        self.assertIn("text/html", resp.headers["content-type"])
+
+    def test_unset_fields_report_not_set(self):
+        with tempfile.TemporaryDirectory() as d:
+            env_path = str(Path(d) / ".env")
+            app = create_app(Orchestrator(guard_config=_LOCAL), env_path=env_path)
+            resp = TestClient(app).get("/settings/data")
+        fields = {f["key"]: f for f in resp.json()["fields"]}
+        self.assertFalse(fields["FIRECRAWL_API_KEY"]["set"])
+        self.assertEqual(fields["FIRECRAWL_API_KEY"]["value"], "")
+
+    def test_secret_field_is_masked_not_echoed_in_plaintext(self):
+        with tempfile.TemporaryDirectory() as d:
+            env_path = str(Path(d) / ".env")
+            Path(env_path).write_text("FIRECRAWL_API_KEY=fc-supersecrettoken1234\n", encoding="utf-8")
+            app = create_app(Orchestrator(guard_config=_LOCAL), env_path=env_path)
+            resp = TestClient(app).get("/settings/data")
+        fields = {f["key"]: f for f in resp.json()["fields"]}
+        masked = fields["FIRECRAWL_API_KEY"]["value"]
+        self.assertTrue(fields["FIRECRAWL_API_KEY"]["set"])
+        self.assertNotIn("supersecrettoken", masked)
+        self.assertTrue(masked.endswith("1234"))
+
+    def test_non_secret_field_shown_in_full(self):
+        with tempfile.TemporaryDirectory() as d:
+            env_path = str(Path(d) / ".env")
+            Path(env_path).write_text("NVIDIA_MODEL=nvidia/nemotron-3-super-120b-a12b\n", encoding="utf-8")
+            app = create_app(Orchestrator(guard_config=_LOCAL), env_path=env_path)
+            resp = TestClient(app).get("/settings/data")
+        fields = {f["key"]: f for f in resp.json()["fields"]}
+        self.assertEqual(fields["NVIDIA_MODEL"]["value"], "nvidia/nemotron-3-super-120b-a12b")
+
+    def test_post_writes_to_env_file(self):
+        with tempfile.TemporaryDirectory() as d:
+            env_path = str(Path(d) / ".env")
+            app = create_app(Orchestrator(guard_config=_LOCAL), env_path=env_path)
+            resp = TestClient(app).post("/settings", json={"FIRECRAWL_API_KEY": "fc-newkey"})
+            self.assertEqual(resp.status_code, 200)
+            self.assertTrue(resp.json()["saved"])
+            self.assertEqual(read_env(env_path)["FIRECRAWL_API_KEY"], "fc-newkey")
+
+    def test_post_ignores_unknown_keys(self):
+        with tempfile.TemporaryDirectory() as d:
+            env_path = str(Path(d) / ".env")
+            app = create_app(Orchestrator(guard_config=_LOCAL), env_path=env_path)
+            TestClient(app).post("/settings", json={"NOT_A_REAL_SETTING": "whatever"})
+        self.assertEqual(read_env(env_path), {})
+
+    def test_blank_value_leaves_existing_key_untouched(self):
+        with tempfile.TemporaryDirectory() as d:
+            env_path = str(Path(d) / ".env")
+            Path(env_path).write_text("FIRECRAWL_API_KEY=fc-existing\n", encoding="utf-8")
+            app = create_app(Orchestrator(guard_config=_LOCAL), env_path=env_path)
+            TestClient(app).post("/settings", json={"NVIDIA_API_KEY": "nvapi-new"})
+            result = read_env(env_path)
+            self.assertEqual(result["FIRECRAWL_API_KEY"], "fc-existing")
+            self.assertEqual(result["NVIDIA_API_KEY"], "nvapi-new")
 
 
 if __name__ == "__main__":

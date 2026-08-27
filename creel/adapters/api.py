@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 from pathlib import Path
 from typing import Callable, Optional
 
@@ -28,13 +29,34 @@ from starlette.responses import HTMLResponse, JSONResponse
 from starlette.routing import Route
 
 _WEB_INDEX = Path(__file__).parent / "web" / "index.html"
+_WEB_SETTINGS = Path(__file__).parent / "web" / "settings.html"
 
+from creel.core.env import read_env, write_env
 from creel.core.events import AttemptFinished, AttemptStarted, EventBus
 from creel.core.orchestrator import CooldownActive, Orchestrator, ScrapeResult
 from creel.core.prune import prune_html
 from creel.extract import pipeline as extract_pipeline
 
 _DEFAULT_INCLUDE = "data,markdown"
+
+# (key, label, is_secret, restart_note) -- the fixed set of settings this
+# page manages. is_secret controls masking; restart_note is shown next to
+# fields the running server can't hot-reload (Firecrawl key is baked into
+# Orchestrator at construction time, unlike the NVIDIA provider config
+# which main() re-derives from os.environ on every request).
+SETTINGS_FIELDS = [
+    ("FIRECRAWL_API_KEY", "Firecrawl API Key", True, "restart required"),
+    ("NVIDIA_API_KEY", "NVIDIA API Key", True, "applies immediately"),
+    ("NVIDIA_MODEL", "NVIDIA Model", False, "applies immediately"),
+    ("NVIDIA_BASE_URL", "NVIDIA Base URL", False, "applies immediately"),
+    ("NVIDIA_MODEL_TOKENS", "NVIDIA Model Tokens", False, "applies immediately"),
+]
+
+
+def _mask(value: str) -> str:
+    if len(value) <= 4:
+        return "*" * len(value)
+    return "*" * (len(value) - 4) + value[-4:]
 
 
 def _parse_include(request: Request) -> set[str]:
@@ -80,11 +102,42 @@ def create_app(
     llm_extract: Optional[Callable] = None,
     model: str = "unset",
     model_tokens: int = 8192,
+    env_path: str = ".env",
 ) -> Starlette:
     orch = orchestrator or Orchestrator()
 
     async def index(request: Request) -> HTMLResponse:
         return HTMLResponse(_WEB_INDEX.read_text(encoding="utf-8"))
+
+    async def settings_page(request: Request) -> HTMLResponse:
+        return HTMLResponse(_WEB_SETTINGS.read_text(encoding="utf-8"))
+
+    async def settings_data(request: Request) -> JSONResponse:
+        current = read_env(env_path)
+        fields = [
+            {
+                "key": key,
+                "label": label,
+                "secret": secret,
+                "note": note,
+                "value": _mask(current[key]) if secret and key in current else current.get(key, ""),
+                "set": key in current,
+            }
+            for key, label, secret, note in SETTINGS_FIELDS
+        ]
+        return JSONResponse({"fields": fields})
+
+    async def settings_save(request: Request) -> JSONResponse:
+        body = await request.json()
+        known_keys = {key for key, *_ in SETTINGS_FIELDS}
+        updates = {k: v for k, v in body.items() if k in known_keys and isinstance(v, str)}
+        write_env(updates, env_path)
+        for key, value in updates.items():
+            if value:
+                os.environ[key] = value
+            else:
+                os.environ.pop(key, None)
+        return JSONResponse({"saved": True})
 
     async def scrape(request: Request) -> JSONResponse:
         url = request.query_params.get("url")
@@ -155,7 +208,14 @@ def create_app(
         return EventSourceResponse(event_generator())
 
     return Starlette(
-        routes=[Route("/", index), Route("/scrape", scrape), Route("/scrape/stream", scrape_stream)]
+        routes=[
+            Route("/", index),
+            Route("/scrape", scrape),
+            Route("/scrape/stream", scrape_stream),
+            Route("/settings", settings_page, methods=["GET"]),
+            Route("/settings", settings_save, methods=["POST"]),
+            Route("/settings/data", settings_data),
+        ]
     )
 
 
@@ -174,15 +234,19 @@ def main(argv: Optional[list[str]] = None) -> int:
     parser.add_argument("--port", type=int, default=8000)
     args = parser.parse_args(argv)
 
-    provider_config = ProviderConfig.from_env()
-    llm_extract = None
-    model = "unset"
-    model_tokens = 8192
-    if provider_config is not None:
-        async def llm_extract(html, prompt, schema=None, _cfg=provider_config):
-            return await llm_direct_extract(html, prompt, schema=schema, config=_cfg)
-        model = provider_config.model
-        model_tokens = provider_config.model_tokens
+    # Re-derives ProviderConfig.from_env() on every call, not once at
+    # startup, so a key saved through the /settings page (which updates
+    # os.environ directly) takes effect on the very next request -- no
+    # server restart needed for the NVIDIA rung specifically.
+    async def llm_extract(html, prompt, schema=None):
+        cfg = ProviderConfig.from_env()
+        if cfg is None:
+            return await llm_direct_extract(html, prompt, schema=schema, config=None)
+        return await llm_direct_extract(html, prompt, schema=schema, config=cfg)
+
+    initial_config = ProviderConfig.from_env()
+    model = initial_config.model if initial_config else "unset"
+    model_tokens = initial_config.model_tokens if initial_config else 8192
 
     app = create_app(llm_extract=llm_extract, model=model, model_tokens=model_tokens)
     uvicorn.run(app, host=args.host, port=args.port)
