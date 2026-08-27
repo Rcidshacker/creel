@@ -9,7 +9,7 @@ from creel.discover.search import search
 def _fc_client(web_results):
     instance = AsyncMock()
     instance.search = AsyncMock(return_value=SearchData(web=web_results))
-    instance.close = AsyncMock()
+    instance.async_http_client = AsyncMock()
     return patch("firecrawl.v2.AsyncFirecrawlClient", return_value=instance)
 
 

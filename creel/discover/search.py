@@ -35,13 +35,10 @@ async def search(query: str, api_key: Optional[str] = None, limit: int = 10) -> 
 
 
 async def _search_via_firecrawl(query: str, api_key: str, limit: int) -> SearchResponse:
-    from firecrawl.v2 import AsyncFirecrawlClient
+    from creel.engines.firecrawl import client
 
-    client = AsyncFirecrawlClient(api_key=api_key)
-    try:
-        data = await client.search(query, limit=limit)
-    finally:
-        await client.close()
+    async with client(api_key) as c:
+        data = await c.search(query, limit=limit)
     web = data.web or []
     results = [SearchResult(url=r.url, title=r.title or "", snippet=r.description or "") for r in web]
     return SearchResponse(results=results, source="firecrawl")

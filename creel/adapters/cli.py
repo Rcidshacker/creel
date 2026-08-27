@@ -50,7 +50,6 @@ async def _run_fetch(
 
 
 def main(argv: Optional[list[str]] = None) -> int:
-    load_dotenv()
     parser = argparse.ArgumentParser(prog="creel")
     sub = parser.add_subparsers(dest="command", required=True)
 
@@ -60,6 +59,7 @@ def main(argv: Optional[list[str]] = None) -> int:
     fetch_p.add_argument("--show-trace", action="store_true")
 
     args = parser.parse_args(argv)
+    load_dotenv()  # after parsing succeeds, not before -- an invalid-args exit shouldn't touch the environment
     if args.command == "fetch":
         return asyncio.run(_run_fetch(args.url, args.cost_mode, args.show_trace))
     return 1

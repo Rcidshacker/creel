@@ -13,12 +13,16 @@ from creel.engines.firecrawl import available, fetch
 
 
 def _mock_client(scrape_return=None, scrape_side_effect=None):
+    # async_http_client.close() is the real cleanup call -- AsyncFirecrawlClient
+    # itself has no close()/aclose() in the installed SDK version (verified by
+    # inspecting dir() on the real client directly, caught live when the old
+    # `await client.close()` crashed every real, non-mocked call).
     instance = AsyncMock()
     if scrape_side_effect is not None:
         instance.scrape = AsyncMock(side_effect=scrape_side_effect)
     else:
         instance.scrape = AsyncMock(return_value=scrape_return)
-    instance.close = AsyncMock()
+    instance.async_http_client = AsyncMock()
     return patch("firecrawl.v2.AsyncFirecrawlClient", return_value=instance), instance
 
 
@@ -49,7 +53,7 @@ class TestFetch(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(outcome.status, 200)
         self.assertIn(b"content", outcome.body)
         self.assertEqual(outcome.final_url, "https://example.com/final")
-        instance.close.assert_awaited_once()
+        instance.async_http_client.close.assert_awaited_once()
 
     async def test_falls_back_to_markdown_when_no_html(self):
         doc = Document(markdown="# Just markdown", html=None, metadata=DocumentMetadata(status_code=200))
@@ -71,7 +75,7 @@ class TestFetch(unittest.IsolatedAsyncioTestCase):
         with patcher:
             outcome = await fetch("https://example.com", api_key="fc-test")
         self.assertEqual(outcome.status, 429)
-        instance.close.assert_awaited_once()
+        instance.async_http_client.close.assert_awaited_once()
 
     async def test_website_not_supported_maps_to_403(self):
         err = WebsiteNotSupportedError("blocked", status_code=403, response=None)
@@ -86,13 +90,13 @@ class TestFetch(unittest.IsolatedAsyncioTestCase):
             outcome = await fetch("https://example.com", api_key="fc-test")
         self.assertIsNone(outcome.status)
         self.assertTrue(any("exception:" in s for s in outcome.signals))
-        instance.close.assert_awaited_once()
+        instance.async_http_client.close.assert_awaited_once()
 
     async def test_client_always_closed_even_on_error(self):
         patcher, instance = _mock_client(scrape_side_effect=RuntimeError("boom"))
         with patcher:
             await fetch("https://example.com", api_key="fc-test")
-        instance.close.assert_awaited_once()
+        instance.async_http_client.close.assert_awaited_once()
 
 
 if __name__ == "__main__":

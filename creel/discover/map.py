@@ -28,13 +28,10 @@ async def map_site(url: str, api_key: Optional[str] = None, limit: int = 100) ->
 
 
 async def _map_via_firecrawl(url: str, api_key: str, limit: int) -> MapResult:
-    from firecrawl.v2 import AsyncFirecrawlClient
+    from creel.engines.firecrawl import client
 
-    client = AsyncFirecrawlClient(api_key=api_key)
-    try:
-        data = await client.map(url, limit=limit)
-    finally:
-        await client.close()
+    async with client(api_key) as c:
+        data = await c.map(url, limit=limit)
     urls = [link.url for link in data.links]
     return MapResult(urls=urls, source="firecrawl", truncated=len(urls) >= limit)
 

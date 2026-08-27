@@ -22,6 +22,7 @@ branch) describes a newer surface than what's on PyPI.
 from __future__ import annotations
 
 import time
+from contextlib import asynccontextmanager
 from typing import Optional
 
 from creel.core.models import ExecutionModel, FetchOutcome
@@ -36,6 +37,28 @@ def available(api_key: Optional[str]) -> bool:
     return bool(api_key)
 
 
+@asynccontextmanager
+async def client(api_key: str, timeout: Optional[float] = None):
+    """The one place that constructs and tears down AsyncFirecrawlClient --
+    engines/firecrawl.py, discover/map.py, and discover/search.py all route
+    through this instead of each repeating the same broken cleanup call.
+
+    AsyncFirecrawlClient itself has no close()/aclose() in the installed SDK
+    version (verified by inspecting dir(client) directly, caught live when
+    `await client.close()` crashed every real, non-mocked call in all three
+    call sites). The underlying httpx.AsyncClient is reachable at
+    client.async_http_client and DOES expose an async close().
+    """
+    from firecrawl.v2 import AsyncFirecrawlClient
+
+    kwargs = {"timeout": timeout} if timeout is not None else {}
+    c = AsyncFirecrawlClient(api_key=api_key, **kwargs)
+    try:
+        yield c
+    finally:
+        await c.async_http_client.close()
+
+
 async def fetch(
     url: str,
     api_key: Optional[str] = None,
@@ -47,15 +70,14 @@ async def fetch(
     if not available(api_key):
         return FetchOutcome(status=None, headers={}, body=b"", final_url=url, signals=["exception:NoAPIKey"])
 
-    from firecrawl.v2 import AsyncFirecrawlClient
     from firecrawl.v2.utils.error_handler import FirecrawlError
 
     start = time.monotonic()
-    client = AsyncFirecrawlClient(api_key=api_key, timeout=timeout_s)
     try:
-        doc = await client.scrape(
-            url, formats=list(formats), only_main_content=only_main_content, timeout=int(timeout_s * 1000)
-        )
+        async with client(api_key, timeout=timeout_s) as c:
+            doc = await c.scrape(
+                url, formats=list(formats), only_main_content=only_main_content, timeout=int(timeout_s * 1000)
+            )
     except FirecrawlError as e:
         headers = dict(e.response.headers) if e.response is not None else {}
         return FetchOutcome(
@@ -75,8 +97,6 @@ async def fetch(
             signals=[f"exception:{type(e).__name__}"],
             elapsed_ms=int((time.monotonic() - start) * 1000),
         )
-    finally:
-        await client.close()
 
     meta = doc.metadata
     status = (meta.status_code if meta else None) or 200

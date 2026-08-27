@@ -10,7 +10,7 @@ from creel.discover.map import map_site
 def _fc_client(links):
     instance = AsyncMock()
     instance.map = AsyncMock(return_value=MapData(links=links))
-    instance.close = AsyncMock()
+    instance.async_http_client = AsyncMock()
     return patch("firecrawl.v2.AsyncFirecrawlClient", return_value=instance)
 
 
