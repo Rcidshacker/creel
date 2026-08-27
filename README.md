@@ -21,7 +21,7 @@ the selector cache.
 | **[Scrapling](https://github.com/D4Vinci/Scrapling)** | Acquisition (HTTP / dynamic / stealth tiers) and HTML parsing. Async-native. |
 | **[Scrapegraph-ai](https://github.com/ScrapeGraphAI/Scrapegraph-ai)** | LLM structured extraction over HTML already in hand. Never fetches — the one synchronous engine, wrapped via `asyncio.to_thread`. |
 | **[Firecrawl](https://github.com/firecrawl/firecrawl)** | Managed egress, `map`, `search`, native PDF→markdown. |
-| **[Agent-Reach](https://github.com/Panniantong/Agent-Reach)** | Credential vault + capability check for auth-walled platforms (V2EX, GitHub, ...). |
+| **[Agent-Reach](https://github.com/Panniantong/Agent-Reach)** | Credential vault + capability check for auth-walled platforms (V2EX, GitHub, LinkedIn, ...). |
 
 None of these wraps or replaces another — each covers a gap the others
 don't. Design rationale, the full gotcha list, and the phase-by-phase plan
@@ -29,7 +29,7 @@ this repo was built from live in [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md).
 
 ## Status
 
-All five phases (0–4) of the original plan are complete. 252 tests
+All five phases (0–4) of the original plan are complete. 259 tests
 passing, no live third-party host required to run the suite.
 
 | Phase | Delivered |
@@ -57,15 +57,73 @@ Python 3.13 is required — Scrapegraph-ai declares `>=3.12,<4.0`. Never
 
 ### Optional configuration
 
+Copy [`.env.example`](.env.example) to `.env` (git-ignored — never commit
+real keys) and fill in what you have. Nothing here is required; each
+missing key just disables the rung it powers.
+
 | Variable | Effect if unset |
 |---|---|
 | `FIRECRAWL_API_KEY` | Firecrawl engine, PDF handling, and `map`/`search` remote-first paths self-disable; local/Scrapling-only fallbacks still work. |
-| An LLM provider key (passed via `SGAIConfig`/`ProviderConfig`, not auto-read from env) | The LLM extraction rung is unavailable; the selector/markdown rungs still run. |
+| `NVIDIA_API_KEY` (+ optional `NVIDIA_MODEL`/`NVIDIA_BASE_URL`/`NVIDIA_MODEL_TOKENS`) | Powers the default LLM extraction rung (`ProviderConfig.from_env()` in `creel/extract/llm_direct.py`, defaults to `nvidia/nemotron-3-super-120b-a12b` via NVIDIA's hosted API — get a key at [build.nvidia.com](https://build.nvidia.com/)). Unset → the LLM rung is unavailable; the selector/markdown rungs still run. |
 
-Agent-Reach's own per-channel credentials (GitHub token, etc.) are read
-from its own config — see its docs. `platform_cli` probes `agent-reach
-doctor` lazily and degrades to "unavailable" per channel rather than
-failing the whole ladder.
+`.env` is picked up automatically by the CLI and the web/API server (see
+`creel/core/env.py`) — running them yourself just needs the file to
+exist. Wiring your own `ProviderConfig`/`Orchestrator` in code instead of
+using the CLI/API entrypoints means reading these env vars yourself.
+
+### Platform channels (Agent-Reach)
+
+For sites that hit `AUTH_REQUIRED` (a real login wall, not just a bot
+block), the last rung in the ladder is `platform_cli`, which asks
+Agent-Reach whether it has a working channel for that platform. Three are
+currently wired:
+
+| Platform | How it works | Setup needed |
+|---|---|---|
+| **v2ex.com** | Direct Python call into Agent-Reach's `v2ex` channel | None — works out of the box |
+| **github.com** | Subprocess call to the `gh` CLI | `gh auth login` once, if you haven't already |
+| **linkedin.com** (profile URLs, `/in/...`) | Subprocess call to [`mcporter`](https://www.npmjs.com/package/mcporter), which drives the third-party [`mcp-server-linkedin`](https://github.com/stickerdaniel/linkedin-mcp-server) MCP server | See below — a few one-time steps |
+
+Every other channel Agent-Reach knows about (Reddit, Twitter, Instagram,
+...) needs credentials or tooling this project doesn't wire up yet — not
+a bug, just not built.
+
+**Setting up LinkedIn** — LinkedIn's own homepage/profile pages are
+genuinely login-gated for an anonymous fetch (verified live: the page's
+own title is literally "linkedin: log in or sign up"), so getting real
+content requires *your own* LinkedIn session. Nothing here logs in for
+you — you do that part yourself, in a real browser window the tool opens:
+
+```bash
+# 1. One-time: install the CLI that drives MCP servers from the terminal
+npm install -g mcporter
+
+# 2. Log into LinkedIn — opens a real Chromium window (not your default
+#    browser); sign in there yourself, 2FA/captcha included. Saves the
+#    session to ~/.linkedin-mcp/profile for reuse.
+uvx mcp-server-linkedin@latest --login
+
+#    Already logged into LinkedIn in a real browser? Skip step 2's fresh
+#    login and grab that session instead:
+#    uvx mcp-server-linkedin@latest --import-from-browser
+
+# 3. Register the server so mcporter (and Creel) can find it
+mcporter config add linkedin --command uvx --arg mcp-server-linkedin@latest --env UV_HTTP_TIMEOUT=300 --scope home
+```
+
+Verify it worked without hitting a real profile:
+
+```powershell
+.venv\Scripts\python.exe -c "from creel.engines import platform_cli; print(platform_cli.available('linkedin'))"
+```
+
+`True` means Creel will now attempt the `linkedin` rung for
+`linkedin.com/in/...` URLs that hit `AUTH_REQUIRED`. Sessions expire —
+if it stops working later, just repeat step 2.
+
+Only person-profile URLs (`/in/<username>`) are wired, via
+`mcp-server-linkedin`'s `get_person_profile` tool. Company/job pages
+aren't hooked up.
 
 ## Usage
 
@@ -161,7 +219,7 @@ creel/
   extract/     Extraction ladder (selectors -> markdown -> LLM), schema validation, selector learning
   discover/    map() and search()
   adapters/    cli.py, api.py, mcp.py, web/index.html
-tests/         252 tests, unittest + a local fixture server (no live network)
+tests/         259 tests, unittest + a local fixture server (no live network)
 ```
 
 ## Testing
