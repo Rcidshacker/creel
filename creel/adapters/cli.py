@@ -13,6 +13,7 @@ import asyncio
 import sys
 from typing import Optional
 
+from creel.core.env import load_dotenv
 from creel.core.events import AttemptFinished, AttemptStarted, EventBus
 from creel.core.orchestrator import CooldownActive, Orchestrator
 
@@ -49,6 +50,7 @@ async def _run_fetch(
 
 
 def main(argv: Optional[list[str]] = None) -> int:
+    load_dotenv()
     parser = argparse.ArgumentParser(prog="creel")
     sub = parser.add_subparsers(dest="command", required=True)
 

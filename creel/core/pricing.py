@@ -27,6 +27,10 @@ _PRICES: dict[str, ModelPrice] = {
     "anthropic/claude-3-5-sonnet": ModelPrice(0.003, 0.015),
     "anthropic/claude-3-5-haiku": ModelPrice(0.0008, 0.004),
     "ollama/llama3.2": ModelPrice(0.0, 0.0),  # local inference — genuinely free
+    # Free during NVIDIA's hosted preview as of Aug 2026 (rate-limited, not a
+    # committed price) — not "genuinely free" like local inference. Update
+    # this if NVIDIA discloses production per-token pricing.
+    "nvidia/nemotron-3-super-120b-a12b": ModelPrice(0.0, 0.0),
 }
 
 _UNKNOWN = ModelPrice(0.0, 0.0)

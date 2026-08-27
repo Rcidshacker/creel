@@ -164,12 +164,28 @@ def main(argv: Optional[list[str]] = None) -> int:
 
     import uvicorn
 
+    from creel.core.env import load_dotenv
+    from creel.extract.llm_direct import ProviderConfig, extract as llm_direct_extract
+
+    load_dotenv()
+
     parser = argparse.ArgumentParser(prog="creel-web")
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8000)
     args = parser.parse_args(argv)
 
-    uvicorn.run(create_app(), host=args.host, port=args.port)
+    provider_config = ProviderConfig.from_env()
+    llm_extract = None
+    model = "unset"
+    model_tokens = 8192
+    if provider_config is not None:
+        async def llm_extract(html, prompt, schema=None, _cfg=provider_config):
+            return await llm_direct_extract(html, prompt, schema=schema, config=_cfg)
+        model = provider_config.model
+        model_tokens = provider_config.model_tokens
+
+    app = create_app(llm_extract=llm_extract, model=model, model_tokens=model_tokens)
+    uvicorn.run(app, host=args.host, port=args.port)
     return 0
 
 

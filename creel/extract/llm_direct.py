@@ -13,6 +13,7 @@ selectors into the free tier-1 cache.
 from __future__ import annotations
 
 import json
+import os
 from dataclasses import dataclass
 from typing import Optional, Type
 
@@ -22,6 +23,15 @@ from creel.core.prune import count_tokens
 from creel.extract.base import ExtractOutcome
 
 NAME = "llm_direct"
+
+# Confirmed live against the real NVIDIA API (Aug 2026): this exact model id
+# is served at this base_url, and a response_format=json_object call returns
+# valid structured JSON with real (non-estimated) usage counts. Context
+# window is documented up to 1M tokens; NVIDIA_MODEL_TOKENS default below is
+# a conservative working budget, not the model's real ceiling.
+_NVIDIA_DEFAULT_MODEL = "nvidia/nemotron-3-super-120b-a12b"
+_NVIDIA_DEFAULT_BASE_URL = "https://integrate.api.nvidia.com/v1"
+_NVIDIA_DEFAULT_MODEL_TOKENS = 128_000
 
 _SYSTEM_PROMPT = (
     "You extract structured data from web page content. Always respond with a "
@@ -38,6 +48,21 @@ class ProviderConfig:
     api_key: str
     base_url: str = "https://api.openai.com/v1"
     model_tokens: int = 8192
+
+    @classmethod
+    def from_env(cls) -> Optional["ProviderConfig"]:
+        """NVIDIA-hosted default, since that's the provider actually wired
+        up. Returns None (not a config with an empty key) when
+        NVIDIA_API_KEY is unset, so `available()` degrades cleanly."""
+        api_key = os.environ.get("NVIDIA_API_KEY")
+        if not api_key:
+            return None
+        return cls(
+            model=os.environ.get("NVIDIA_MODEL", _NVIDIA_DEFAULT_MODEL),
+            api_key=api_key,
+            base_url=os.environ.get("NVIDIA_BASE_URL", _NVIDIA_DEFAULT_BASE_URL),
+            model_tokens=int(os.environ.get("NVIDIA_MODEL_TOKENS", _NVIDIA_DEFAULT_MODEL_TOKENS)),
+        )
 
 
 def available(config: Optional[ProviderConfig]) -> bool:
