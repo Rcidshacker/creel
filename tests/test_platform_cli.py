@@ -181,17 +181,30 @@ class TestFetchLinkedin(unittest.IsolatedAsyncioTestCase):
         return proc
 
     async def test_profile_url_calls_mcporter_get_person_profile(self):
+        # mcporter resolves through shutil.which() -- on Windows it's only
+        # invocable as the mcporter.cmd npm shim, not a bare "mcporter"
+        # (verified live: create_subprocess_exec("mcporter", ...) raised
+        # FileNotFoundError against the real install, since it doesn't do
+        # PATHEXT resolution the way a shell does). Patch which() so this
+        # test doesn't depend on any particular machine's install path.
         proc = await self._mock_proc(0, b'{"name":"Jane Doe"}')
         url = "https://www.linkedin.com/in/janedoe"
         with patch.object(platform_cli._doctor, "available", return_value=True), patch(
             "asyncio.create_subprocess_exec", unittest.mock.AsyncMock(return_value=proc)
-        ) as mock_exec:
+        ) as mock_exec, patch("shutil.which", return_value="/fake/path/mcporter.cmd"):
             outcome = await fetch(url)
         self.assertEqual(outcome.status, 200)
         args = mock_exec.await_args.args
         self.assertEqual(
             args,
-            ("mcporter", "call", "linkedin.get_person_profile", f"linkedin_username={url}", "--output", "json"),
+            (
+                "/fake/path/mcporter.cmd",
+                "call",
+                "linkedin.get_person_profile",
+                f"linkedin_username={url}",
+                "--output",
+                "json",
+            ),
         )
 
     async def test_non_profile_url_is_unsupported(self):

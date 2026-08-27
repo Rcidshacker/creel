@@ -43,6 +43,7 @@ import asyncio
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import time
@@ -237,8 +238,16 @@ async def _run_mcporter(args: list[str], url: str) -> FetchOutcome:
     if sys.platform == "win32":
         kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
 
+    # npm installs mcporter on Windows as mcporter.cmd (a shim), not a
+    # directly-executable .exe like `gh` -- create_subprocess_exec does not
+    # do PATHEXT resolution the way a real shell does, so a bare "mcporter"
+    # raises FileNotFoundError. Caught live: the raw `mcporter call ...`
+    # worked fine in a shell, but Creel's own platform_cli.fetch() failed
+    # until resolved through shutil.which() here.
+    exe = shutil.which("mcporter") or "mcporter"
+
     proc = await asyncio.create_subprocess_exec(
-        "mcporter",
+        exe,
         *args,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
