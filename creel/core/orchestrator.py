@@ -32,6 +32,7 @@ from creel.core.memory import TierMemory
 from creel.core.models import Attempt, FailureClass, FetchOutcome, ScrapeResult
 from creel.core.policy import PolicyResolver
 from creel.core.pool import ConcurrencyPool
+from creel.core.robots import RobotsChecker
 from creel.core.store import Store
 from creel.core.urlnorm import canonicalize, registrable_domain
 
@@ -83,6 +84,15 @@ def _firecrawl_spec(api_key: str) -> EngineSpec:
     return EngineSpec("firecrawl", 5, False, _fetch)
 
 
+def _platform_cli_spec() -> EngineSpec:
+    from creel.engines import platform_cli
+
+    async def _fetch(url: str, guard_config=None, **_ignored) -> FetchOutcome:
+        return await platform_cli.fetch(url)
+
+    return EngineSpec("platform_cli", 6, False, _fetch)
+
+
 def default_remote_egress_chain(cost_mode: str, firecrawl_api_key: Optional[str] = None) -> list[EngineSpec]:
     """Order is the cost_mode policy knob: frugal tries the free rung
     first, reliable tries the higher-success-rate paid rung first. Jina is
@@ -113,6 +123,8 @@ class Orchestrator:
         local_ladder: Optional[list[EngineSpec]] = None,
         remote_egress_chain: Optional[list[EngineSpec]] = None,
         firecrawl_api_key: Optional[str] = None,
+        respect_robots: bool = True,
+        robots_checker: Optional[RobotsChecker] = None,
     ) -> None:
         self.store = store
         self.pool = pool or ConcurrencyPool()
@@ -124,6 +136,8 @@ class Orchestrator:
         self.guard_config = guard_config or GuardConfig()
         self.blocked_markers = blocked_markers or []
         self.fetch_ttl_s = fetch_ttl_s
+        self.respect_robots = respect_robots
+        self.robots_checker = robots_checker or RobotsChecker()
         self.local_ladder = local_ladder if local_ladder is not None else default_local_ladder()
         # None means "compute per-call from cost_mode" — the chain's ORDER
         # depends on cost_mode, which is a per-fetch argument, not fixed at
@@ -160,6 +174,8 @@ class Orchestrator:
             local_ladder=self.local_ladder,
             remote_egress_chain=self._remote_egress_chain_override,
             firecrawl_api_key=self.firecrawl_api_key,
+            respect_robots=self.respect_robots,
+            robots_checker=self.robots_checker,
         )
 
     async def fetch(self, url: str, cost_mode: Optional[str] = None) -> ScrapeResult:
@@ -210,6 +226,13 @@ class Orchestrator:
                 continue
             if not self.breaker.allow(spec.name, domain):
                 continue
+            if self.respect_robots and spec.name == "scrapling_stealth":
+                # solve_cloudflare=True is an explicit anti-bot bypass — it
+                # must never fire against a host that asked automated
+                # agents not to access this path. Skip straight to the
+                # next tier (remote egress), same as any other tier miss.
+                if not await self.robots_checker.allowed(url):
+                    continue
 
             outcome, failure = await self._run_engine(spec, url, run_id, domain, attempts)
             engine_path.append(spec.name)
@@ -235,8 +258,14 @@ class Orchestrator:
             if failure == FailureClass.RATE_LIMITED:
                 self.cooldowns.register(domain, _extract_retry_after(outcome))
                 return self._finalize_failed(run_id, canonical, url, engine_path, attempts)
-            if failure in (FailureClass.NOT_FOUND, FailureClass.UNSUPPORTED_CONTENT, FailureClass.AUTH_REQUIRED):
+            if failure in (FailureClass.NOT_FOUND, FailureClass.UNSUPPORTED_CONTENT):
                 return self._finalize_failed(run_id, canonical, url, engine_path, attempts)
+            if failure == FailureClass.AUTH_REQUIRED:
+                # Login-walled content on a KNOWN platform: try the
+                # platform-specific authenticated backend once (Agent-Reach
+                # containment — see engines/platform_cli.py), not the
+                # generic ladder, which has nothing better to offer here.
+                return await self._try_platform_cli(url, canonical, run_id, domain, engine_path, attempts)
             # JS_REQUIRED / BLOCKED / NETWORK -> try the next local tier
 
         # Local ladder exhausted (or fully breaker-tripped) -> remote egress.
@@ -288,6 +317,22 @@ class Orchestrator:
             return self._finalize_failed(run_id, canonical, url, engine_path, attempts)
 
         spec = _firecrawl_spec(self.firecrawl_api_key)
+        outcome, failure = await self._run_engine(spec, url, run_id, domain, attempts)
+        engine_path.append(spec.name)
+        if failure is None:
+            self._cache_put(canonical, spec.name, outcome)
+            return self._finalize_ok(run_id, canonical, engine_path, outcome, attempts)
+        return self._finalize_failed(run_id, canonical, url, engine_path, attempts)
+
+    async def _try_platform_cli(
+        self, url: str, canonical: str, run_id: str, domain: str, engine_path: list[str], attempts: list[Attempt]
+    ) -> ScrapeResult:
+        """One attempt at the platform-specific authenticated backend for
+        login-walled content on a known platform (github.com, v2ex.com,
+        ...). Never escalates further — if the platform channel is
+        unavailable or also fails, this is terminal, same as any other
+        AUTH_REQUIRED with nothing left to try."""
+        spec = _platform_cli_spec()
         outcome, failure = await self._run_engine(spec, url, run_id, domain, attempts)
         engine_path.append(spec.name)
         if failure is None:
