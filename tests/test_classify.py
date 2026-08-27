@@ -39,6 +39,34 @@ class TestClassifyStatus(unittest.TestCase):
         body = b"<html>Please sign in to continue</html>"
         self.assertEqual(classify_status(outcome(200, body=body)), FailureClass.AUTH_REQUIRED)
 
+    def test_200_with_login_only_in_href_attribute_is_not_auth_required(self):
+        # Caught live: economictimes.com matched "login" only inside an
+        # unrelated ad-network href, never in rendered text.
+        body = (
+            b"<html><body><nav><a href='/ads/loginselfservice.htm'>ad</a></nav>"
+            b"<article>Real public headline content goes here.</article></body></html>"
+        )
+        self.assertIsNone(classify_status(outcome(200, body=body)))
+
+    def test_200_large_real_page_with_incidental_nav_link_is_not_auth_required(self):
+        # Caught live: a plain "sign in" nav link is present on nearly every
+        # real site and says nothing about the page being gated -- only a
+        # SMALL page dominated by that prompt (LinkedIn's real anonymous
+        # login wall, ~32k visible chars) should count as genuinely gated.
+        # economictimes.com's real homepage has ~51k visible chars of actual
+        # article content plus an incidental nav "sign in" link.
+        body = (
+            b"<html><body><nav><a href='/account'>sign in</a></nav><article>"
+            + b"Real news paragraph content. " * 2000
+            + b"</article></body></html>"
+        )
+        self.assertIsNone(classify_status(outcome(200, body=body)))
+
+    def test_200_with_blocked_marker_only_in_attribute_is_not_blocked(self):
+        body = b"<html><a href='/access-denied-help'>Learn more</a><p>Normal page</p></html>"
+        result = classify_status(outcome(200, body=body), blocked_markers=["access denied"])
+        self.assertIsNone(result)
+
     def test_200_with_blocked_marker_is_blocked(self):
         body = b"<html>Access Denied by WAF</html>"
         result = classify_status(outcome(200, body=body), blocked_markers=["access denied"])

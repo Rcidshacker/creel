@@ -11,6 +11,7 @@ system, not as a real user backing off.
 """
 from __future__ import annotations
 
+import re
 from typing import Iterable, Optional
 
 from creel.core.models import FailureClass, FetchOutcome
@@ -18,9 +19,22 @@ from creel.core.models import FailureClass, FetchOutcome
 _BLOCKED_CODES = {401, 403, 407, 444, 500, 502, 503, 504}
 _TERMINAL_CODES = {404, 410}
 
+_SCRIPT_STYLE_RE = re.compile(r"<(script|style)\b[^>]*>.*?</\1>", re.DOTALL)
+_TAG_RE = re.compile(r"<[^>]+>")
+
 _JS_MIN_BODY_LEN = 200
 _JS_SCRIPT_DENSITY_THRESHOLD = 0.6
 _JS_MAX_VISIBLE_LEN = 500
+
+# A real "log in"/"sign in" nav link is present on nearly every real site and
+# says nothing about whether the page itself is gated -- measured live
+# against real pages to calibrate this: linkedin.com's actual anonymous-user
+# login wall (a genuine gate) collapses to ~32k chars of visible text;
+# economictimes.com's homepage, misclassified before this fix because
+# "login" appeared only in an unrelated ad-network href, has ~51k chars of
+# real visible article content. This threshold sits between those two real
+# measurements, not an arbitrary guess.
+_AUTH_MAX_VISIBLE_LEN = 40_000
 
 _DEFAULT_AUTH_MARKERS = ("sign in", "log in", "login", "please authenticate")
 
@@ -55,12 +69,21 @@ def classify_status(
             return FailureClass.BLOCKED
 
         text = outcome.body.decode("utf-8", errors="ignore").lower()
+        # blocked/auth markers match against VISIBLE text only -- a real page
+        # matched here live: economictimes.com and medium.com both matched
+        # "login" only inside an unrelated ad-network href and a nav link's
+        # URL, never in rendered text, and were misclassified AUTH_REQUIRED
+        # as a result. Matching the raw HTML (including attribute values)
+        # is too broad; _looks_js_required still uses raw `text` below since
+        # its script-density calc needs the actual <script> tags intact.
+        visible = _visible_text(text)
         for marker in blocked_markers:
-            if marker.lower() in text:
+            if marker.lower() in visible:
                 return FailureClass.BLOCKED
-        for marker in auth_markers:
-            if marker in text:
-                return FailureClass.AUTH_REQUIRED
+        if len(visible) < _AUTH_MAX_VISIBLE_LEN:
+            for marker in auth_markers:
+                if marker in visible:
+                    return FailureClass.AUTH_REQUIRED
         if _looks_js_required(text):
             return FailureClass.JS_REQUIRED
         return None
@@ -69,6 +92,11 @@ def classify_status(
         return FailureClass.BLOCKED
 
     return None
+
+
+def _visible_text(text: str) -> str:
+    without_script_style = _SCRIPT_STYLE_RE.sub(" ", text)
+    return _TAG_RE.sub(" ", without_script_style)
 
 
 def _looks_js_required(text: str) -> bool:
