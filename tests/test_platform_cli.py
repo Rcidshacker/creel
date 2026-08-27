@@ -173,6 +173,53 @@ class TestFetchGithub(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(body["name"], "Hello-World")
 
 
+class TestFetchLinkedin(unittest.IsolatedAsyncioTestCase):
+    async def _mock_proc(self, returncode: int, stdout: bytes, stderr: bytes = b""):
+        proc = MagicMock()
+        proc.communicate = unittest.mock.AsyncMock(return_value=(stdout, stderr))
+        proc.returncode = returncode
+        return proc
+
+    async def test_profile_url_calls_mcporter_get_person_profile(self):
+        proc = await self._mock_proc(0, b'{"name":"Jane Doe"}')
+        url = "https://www.linkedin.com/in/janedoe"
+        with patch.object(platform_cli._doctor, "available", return_value=True), patch(
+            "asyncio.create_subprocess_exec", unittest.mock.AsyncMock(return_value=proc)
+        ) as mock_exec:
+            outcome = await fetch(url)
+        self.assertEqual(outcome.status, 200)
+        args = mock_exec.await_args.args
+        self.assertEqual(
+            args,
+            ("mcporter", "call", "linkedin.get_person_profile", f"linkedin_username={url}", "--output", "json"),
+        )
+
+    async def test_non_profile_url_is_unsupported(self):
+        with patch.object(platform_cli._doctor, "available", return_value=True), patch(
+            "asyncio.create_subprocess_exec"
+        ) as mock_exec:
+            outcome = await fetch("https://www.linkedin.com/company/acme")
+        self.assertIsNone(outcome.status)
+        mock_exec.assert_not_called()
+
+    async def test_nonzero_returncode_becomes_status_none(self):
+        proc = await self._mock_proc(1, b"", b"login required")
+        with patch.object(platform_cli._doctor, "available", return_value=True), patch(
+            "asyncio.create_subprocess_exec", unittest.mock.AsyncMock(return_value=proc)
+        ):
+            outcome = await fetch("https://www.linkedin.com/in/janedoe")
+        self.assertIsNone(outcome.status)
+        self.assertIn("McporterError", outcome.signals[0])
+
+    async def test_unavailable_channel_never_spawns_subprocess(self):
+        with patch.object(platform_cli._doctor, "available", return_value=False), patch(
+            "asyncio.create_subprocess_exec"
+        ) as mock_exec:
+            outcome = await fetch("https://www.linkedin.com/in/janedoe")
+        self.assertIsNone(outcome.status)
+        mock_exec.assert_not_called()
+
+
 class TestFetchUnsupportedHost(unittest.IsolatedAsyncioTestCase):
     async def test_unknown_platform_returns_status_none(self):
         outcome = await fetch("https://example.com/whatever")

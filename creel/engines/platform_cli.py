@@ -25,15 +25,17 @@ produced "error connecting to api.github.com" from `gh`, because Windows'
 network stack (Winsock/TLS) needs SYSTEMROOT to resolve. CREATE_NO_WINDOW
 suppresses the console flash per call.
 
-Only two channels are wired as concrete dispatchers, chosen because both
-are independently verified usable via `agent-reach doctor` on this actual
-machine, and because together they demonstrate the two integration shapes
-every other channel would need: v2ex (a direct Python data method — no
-subprocess) and github (a subprocess CLI call, via the already-authenticated
-`gh`). Every other channel (reddit, facebook, instagram, xiaohongshu,
-twitter, linkedin) needs OpenCLI, cookies, or credentials this environment
-does not have configured — wiring dispatchers for them now would be
-untestable code, not a real capability.
+Three channels are wired as concrete dispatchers: v2ex (a direct Python
+data method — no subprocess), github (a subprocess CLI call via the
+already-authenticated `gh`), and linkedin (a subprocess call to `mcporter`,
+which drives the third-party `mcp-server-linkedin` MCP server -- Agent-Reach's
+own LinkedInChannel carries no direct data method at all, unlike v2ex/github;
+its "backend" is genuinely that external MCP server). All three are
+independently verified usable via `agent-reach doctor`/`check()` on this
+actual machine. Every other channel (reddit, facebook, instagram,
+xiaohongshu, twitter) needs OpenCLI, cookies, or credentials this
+environment does not have configured — wiring dispatchers for them now
+would be untestable code, not a real capability.
 """
 from __future__ import annotations
 
@@ -125,6 +127,8 @@ async def fetch(url: str, guard_config=None, **_ignored) -> FetchOutcome:
             outcome = await asyncio.to_thread(_fetch_v2ex, url)
         elif "github.com" in host:
             outcome = await _fetch_github(url)
+        elif "linkedin.com" in host:
+            outcome = await _fetch_linkedin(url)
         else:
             outcome = None
     except Exception as e:
@@ -207,5 +211,48 @@ async def _run_gh(args: list[str], url: str) -> FetchOutcome:
             body=stderr,
             final_url=url,
             signals=["exception:GhCliError"],
+        )
+    return FetchOutcome(status=200, headers={"content-type": "application/json"}, body=stdout, final_url=url)
+
+
+async def _fetch_linkedin(url: str) -> Optional[FetchOutcome]:
+    if not available("linkedin"):
+        return None
+    if "/in/" not in urlsplit(url).path:
+        # Only person-profile URLs are wired (mcp-server-linkedin's
+        # get_person_profile tool). Company/job pages use different tools
+        # this dispatcher doesn't call yet.
+        return None
+
+    # get_person_profile's own docs: "A full profile URL is accepted too and
+    # is reduced to the username" -- passing the URL directly avoids
+    # reimplementing that parsing here.
+    return await _run_mcporter(
+        ["call", "linkedin.get_person_profile", f"linkedin_username={url}", "--output", "json"], url
+    )
+
+
+async def _run_mcporter(args: list[str], url: str) -> FetchOutcome:
+    kwargs = {}
+    if sys.platform == "win32":
+        kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
+
+    proc = await asyncio.create_subprocess_exec(
+        "mcporter",
+        *args,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+        env=_child_env(),
+        **kwargs,
+    )
+    stdout, stderr = await proc.communicate()
+
+    if proc.returncode != 0:
+        return FetchOutcome(
+            status=None,
+            headers={},
+            body=stderr,
+            final_url=url,
+            signals=["exception:McporterError"],
         )
     return FetchOutcome(status=200, headers={"content-type": "application/json"}, body=stdout, final_url=url)
