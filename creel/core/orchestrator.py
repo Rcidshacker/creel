@@ -15,6 +15,7 @@ real servers — Phase 1a's hermetic-tests principle applies here too.
 from __future__ import annotations
 
 import hashlib
+import os
 import time
 import uuid
 from dataclasses import dataclass
@@ -64,13 +65,36 @@ def default_local_ladder() -> list[EngineSpec]:
     ]
 
 
-def default_remote_egress() -> EngineSpec:
+def _jina_spec() -> EngineSpec:
     from creel.engines import jina as jina_engine
 
     async def _fetch(url: str, guard_config=None, **_ignored) -> FetchOutcome:
         return await jina_engine.fetch(url)
 
     return EngineSpec("jina", 4, False, _fetch)
+
+
+def _firecrawl_spec(api_key: str) -> EngineSpec:
+    from creel.engines import firecrawl as firecrawl_engine
+
+    async def _fetch(url: str, guard_config=None, **_ignored) -> FetchOutcome:
+        return await firecrawl_engine.fetch(url, api_key=api_key)
+
+    return EngineSpec("firecrawl", 5, False, _fetch)
+
+
+def default_remote_egress_chain(cost_mode: str, firecrawl_api_key: Optional[str] = None) -> list[EngineSpec]:
+    """Order is the cost_mode policy knob: frugal tries the free rung
+    first, reliable tries the higher-success-rate paid rung first. Jina is
+    always present (keyless); Firecrawl only joins the chain when a key is
+    configured — its absence must disable the rung, not crash anything."""
+    from creel.engines import firecrawl as firecrawl_engine
+
+    jina = _jina_spec()
+    if not firecrawl_engine.available(firecrawl_api_key):
+        return [jina]
+    firecrawl = _firecrawl_spec(firecrawl_api_key)
+    return [firecrawl, jina] if cost_mode == "reliable" else [jina, firecrawl]
 
 
 class Orchestrator:
@@ -87,7 +111,8 @@ class Orchestrator:
         blocked_markers: Optional[list[str]] = None,
         fetch_ttl_s: float = 3600.0,
         local_ladder: Optional[list[EngineSpec]] = None,
-        remote_egress: Optional[EngineSpec] = None,
+        remote_egress_chain: Optional[list[EngineSpec]] = None,
+        firecrawl_api_key: Optional[str] = None,
     ) -> None:
         self.store = store
         self.pool = pool or ConcurrencyPool()
@@ -100,8 +125,42 @@ class Orchestrator:
         self.blocked_markers = blocked_markers or []
         self.fetch_ttl_s = fetch_ttl_s
         self.local_ladder = local_ladder if local_ladder is not None else default_local_ladder()
-        self.remote_egress = remote_egress if remote_egress is not None else default_remote_egress()
+        # None means "compute per-call from cost_mode" — the chain's ORDER
+        # depends on cost_mode, which is a per-fetch argument, not fixed at
+        # construction. An explicit override (tests, or a caller pinning a
+        # chain) always wins over that dynamic resolution.
+        self._remote_egress_chain_override = remote_egress_chain
+        self.firecrawl_api_key = (
+            firecrawl_api_key if firecrawl_api_key is not None else os.environ.get("FIRECRAWL_API_KEY")
+        )
         self._flight = SingleFlight()
+
+    def with_events(self, events: EventBus) -> "Orchestrator":
+        """A child Orchestrator sharing all stateful, cross-request infra
+        (pool, breaker, cooldowns, memory, store) but with its own isolated
+        EventBus. Exists so an SSE handler can stream one request's
+        progress without mutating a shared instance's event bus, which
+        would clobber any other concurrent request listening on it.
+
+        The child gets its own SingleFlight, so single-flight dedup does
+        not cross the streaming/non-streaming boundary — an accepted
+        trade-off for a request-scoped clone rather than a fully separate
+        Orchestrator construction."""
+        return Orchestrator(
+            store=self.store,
+            pool=self.pool,
+            breaker=self.breaker,
+            cooldowns=self.cooldowns,
+            memory=self.memory,
+            policy=self.policy,
+            events=events,
+            guard_config=self.guard_config,
+            blocked_markers=self.blocked_markers,
+            fetch_ttl_s=self.fetch_ttl_s,
+            local_ladder=self.local_ladder,
+            remote_egress_chain=self._remote_egress_chain_override,
+            firecrawl_api_key=self.firecrawl_api_key,
+        )
 
     async def fetch(self, url: str, cost_mode: Optional[str] = None) -> ScrapeResult:
         canonical = canonicalize(url)
@@ -135,10 +194,9 @@ class Orchestrator:
         # itself via the Content-Type header, checked again below once we
         # actually have a response.
         content = classify_content(url)
-        if content in (ContentClass.PDF, ContentClass.UNSUPPORTED):
-            # Firecrawl's native PDF->markdown rung is Phase 3. Until then,
-            # PDF terminates without escalation rather than laundering
-            # through jina (never designed for binary content) or NETWORK.
+        if content == ContentClass.PDF:
+            return await self._handle_pdf(url, canonical, run_id, domain)
+        if content == ContentClass.UNSUPPORTED:
             return ScrapeResult(url=canonical, final_url=url, status="failed", engine_path=[])
 
         resolved = self.policy.resolve(domain, cost_mode)
@@ -161,7 +219,9 @@ class Orchestrator:
             # URL) never gets pushed through browser tiers or cached as HTML.
             if outcome is not None and outcome.status is not None:
                 actual_content = classify_content(url, _content_type_header(outcome))
-                if actual_content in (ContentClass.PDF, ContentClass.UNSUPPORTED):
+                if actual_content == ContentClass.PDF:
+                    return await self._handle_pdf(url, canonical, run_id, domain, engine_path, attempts)
+                if actual_content == ContentClass.UNSUPPORTED:
                     return self._finalize_failed(run_id, canonical, url, engine_path, attempts)
 
             if failure is None:
@@ -180,23 +240,59 @@ class Orchestrator:
             # JS_REQUIRED / BLOCKED / NETWORK -> try the next local tier
 
         # Local ladder exhausted (or fully breaker-tripped) -> remote egress.
-        remote_outcome, remote_failure = await self._run_engine(
-            self.remote_egress, url, run_id, domain, attempts
-        )
-        engine_path.append(self.remote_egress.name)
+        # Order is the cost_mode policy knob (frugal: jina then firecrawl;
+        # reliable: the reverse) — resolved dynamically per call unless a
+        # caller pinned an explicit chain (tests do this to stay hermetic).
+        remote_chain = self._remote_egress_chain_override
+        if remote_chain is None:
+            remote_chain = default_remote_egress_chain(resolved.cost_mode, self.firecrawl_api_key)
 
         local_was_blocked = any(a.failure_class == FailureClass.BLOCKED for a in attempts)
+        last_remote_failure: Optional[FailureClass] = None
 
-        if remote_failure is None:
-            if local_was_blocked:
-                # Local stealth failed, remote egress succeeded: the
-                # differing variable was our IP, not the domain's policy.
-                self.memory.record_ip_suspect(domain)
-            self._cache_put(canonical, self.remote_egress.name, remote_outcome)
-            return self._finalize_ok(run_id, canonical, engine_path, remote_outcome, attempts)
+        for spec in remote_chain:
+            remote_outcome, remote_failure = await self._run_engine(spec, url, run_id, domain, attempts)
+            engine_path.append(spec.name)
 
-        if local_was_blocked and remote_failure == FailureClass.BLOCKED:
+            if remote_failure is None:
+                if local_was_blocked:
+                    # Local stealth failed, this remote rung succeeded: the
+                    # differing variable was our IP, not the domain's policy.
+                    self.memory.record_ip_suspect(domain)
+                self._cache_put(canonical, spec.name, remote_outcome)
+                return self._finalize_ok(run_id, canonical, engine_path, remote_outcome, attempts)
+
+            last_remote_failure = remote_failure
+
+        if local_was_blocked and last_remote_failure == FailureClass.BLOCKED:
             self.memory.record_domain_hostile(domain, tier=3)
+        return self._finalize_failed(run_id, canonical, url, engine_path, attempts)
+
+    async def _handle_pdf(
+        self,
+        url: str,
+        canonical: str,
+        run_id: str,
+        domain: str,
+        engine_path: Optional[list[str]] = None,
+        attempts: Optional[list[Attempt]] = None,
+    ) -> ScrapeResult:
+        """PDF routes straight to Firecrawl's native PDF->markdown rung when
+        a key is configured; otherwise it terminates rather than laundering
+        through jina (never designed for binary content) or three browser
+        tiers that can't render a PDF into anything useful anyway."""
+        engine_path = engine_path if engine_path is not None else []
+        attempts = attempts if attempts is not None else []
+
+        if not self.firecrawl_api_key:
+            return self._finalize_failed(run_id, canonical, url, engine_path, attempts)
+
+        spec = _firecrawl_spec(self.firecrawl_api_key)
+        outcome, failure = await self._run_engine(spec, url, run_id, domain, attempts)
+        engine_path.append(spec.name)
+        if failure is None:
+            self._cache_put(canonical, spec.name, outcome)
+            return self._finalize_ok(run_id, canonical, engine_path, outcome, attempts)
         return self._finalize_failed(run_id, canonical, url, engine_path, attempts)
 
     async def _run_engine(

@@ -60,7 +60,7 @@ def _make_orchestrator(server: FixtureServer, remote_target: str = "/cf-403", st
         memory=TierMemory(),
         guard_config=_LOCAL,
         local_ladder=_stub_local_ladder(),
-        remote_egress=_fixed_target_remote("remote", server.url(remote_target)),
+        remote_egress_chain=[_fixed_target_remote("remote", server.url(remote_target))],
     )
 
 
@@ -112,7 +112,7 @@ class TestLadderEscalation(unittest.IsolatedAsyncioTestCase):
                 memory=memory,
                 guard_config=_LOCAL,
                 local_ladder=_stub_local_ladder(),
-                remote_egress=_fixed_target_remote("remote", server.url("/ok")),
+                remote_egress_chain=[_fixed_target_remote("remote", server.url("/ok"))],
             )
             result = await orch.fetch(server.url("/cf-403"))
         self.assertEqual(result.status, "ok")
@@ -155,7 +155,7 @@ class TestCache(unittest.IsolatedAsyncioTestCase):
                 memory=TierMemory(),
                 guard_config=_LOCAL,
                 local_ladder=[counting_spec],
-                remote_egress=_fixed_target_remote("remote", server.url("/ok")),
+                remote_egress_chain=[_fixed_target_remote("remote", server.url("/ok"))],
             )
             first = await orch.fetch(server.url("/ok"))
             self.assertFalse(first.from_cache)
@@ -177,7 +177,7 @@ class TestSingleFlight(unittest.IsolatedAsyncioTestCase):
                 memory=TierMemory(),
                 guard_config=_LOCAL,
                 local_ladder=[counting_spec],
-                remote_egress=_fixed_target_remote("remote", server.url("/ok")),
+                remote_egress_chain=[_fixed_target_remote("remote", server.url("/ok"))],
             )
             url = server.url("/ok")
             results = await asyncio.gather(orch.fetch(url), orch.fetch(url))
