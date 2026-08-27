@@ -157,3 +157,21 @@ def create_app(
     return Starlette(
         routes=[Route("/", index), Route("/scrape", scrape), Route("/scrape/stream", scrape_stream)]
     )
+
+
+def main(argv: Optional[list[str]] = None) -> int:
+    import argparse
+
+    import uvicorn
+
+    parser = argparse.ArgumentParser(prog="creel-web")
+    parser.add_argument("--host", default="127.0.0.1")
+    parser.add_argument("--port", type=int, default=8000)
+    args = parser.parse_args(argv)
+
+    uvicorn.run(create_app(), host=args.host, port=args.port)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

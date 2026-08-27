@@ -78,22 +78,31 @@ failing the whole ladder.
 `--cost-mode {frugal,reliable}` controls remote-egress ordering (Jina vs.
 Firecrawl first) once local tiers are exhausted.
 
-### HTTP API
+### HTTP API + web UI
+
+```powershell
+.venv\Scripts\python.exe -m creel.adapters.api --port 8000
+```
+
+Then open `http://127.0.0.1:8000/` for the web UI, or use the API directly:
+
+- `GET /scrape?url=...&include=data,markdown` — one JSON response.
+- `GET /scrape/stream?url=...` — Server-Sent Events, emits every attempt as
+  it happens (a stealth escalation + LLM call can exceed a client's
+  default 30–60s timeout; streaming avoids that without a job queue).
+- `GET /` — the single-page web UI, driving `/scrape/stream` live.
+
+`--host`/`--port` override the bind address. To wire a configured
+`Orchestrator` (LLM extractor, Firecrawl key, custom policy) instead of the
+defaults, call `create_app(...)` yourself and run it with `uvicorn`:
 
 ```python
 from creel.adapters.api import create_app
 from creel.core.orchestrator import Orchestrator
 import uvicorn
 
-app = create_app(Orchestrator())
-uvicorn.run(app)
+uvicorn.run(create_app(Orchestrator(firecrawl_api_key="...")))
 ```
-
-- `GET /scrape?url=...&include=data,markdown` — one JSON response.
-- `GET /scrape/stream?url=...` — Server-Sent Events, emits every attempt as
-  it happens (a stealth escalation + LLM call can exceed a client's
-  default 30–60s timeout; streaming avoids that without a job queue).
-- `GET /` — a single-page web UI over `/scrape/stream`.
 
 ### MCP server
 
